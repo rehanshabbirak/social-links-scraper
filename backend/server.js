@@ -423,18 +423,46 @@ async function scrapePage(page, url, options = {}) {
     await page.setDefaultNavigationTimeout(timeout);
     await page.setUserAgent(generateUserAgent());
     
-    // Navigate to page
-    await page.goto(url, { 
-      waitUntil: 'networkidle2',
-      timeout: timeout
-    });
+    // Navigate to page with retry logic
+    let navigationSuccess = false;
+    let lastError = null;
+    const maxRetries = 2;
     
-    // Wait for dynamic content
-    await page.waitForTimeout(2000);
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await page.goto(url, { 
+          waitUntil: 'domcontentloaded', // Faster than networkidle2
+          timeout: Math.min(timeout, 30000) // Increased to 30 seconds for slow websites
+        });
+        navigationSuccess = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxRetries) {
+          logger.warn(`Navigation attempt ${attempt} failed for ${url} (timeout: 30s), retrying...`);
+          await page.waitForTimeout(1000 * attempt); // Exponential backoff
+        }
+      }
+    }
     
-    // Get page content
-    const content = await page.content();
-    const textContent = await page.evaluate(() => document.body.innerText);
+    if (!navigationSuccess) {
+      throw lastError;
+    }
+    
+    // Wait for dynamic content (reduced for faster processing)
+    await page.waitForTimeout(1000);
+    
+    // Get page content with fallback
+    let content, textContent;
+    try {
+      content = await page.content();
+      textContent = await page.evaluate(() => document.body.innerText);
+    } catch (error) {
+      logger.warn(`Failed to get page content for ${url}, using fallback: ${error.message}`);
+      // Fallback: try to get basic HTML
+      content = await page.evaluate(() => document.documentElement.outerHTML);
+      textContent = await page.evaluate(() => document.documentElement.innerText || '');
+    }
     
     // Extract data
     const emails = new Set([
@@ -493,10 +521,10 @@ async function scrapePage(page, url, options = {}) {
       for (const link of links) {
         try {
           await page.goto(link, { 
-            waitUntil: 'networkidle2', 
-            timeout: 15000 
+            waitUntil: 'domcontentloaded', // Faster loading
+            timeout: 15000 // Increased to 15 seconds for linked pages
           });
-          await page.waitForTimeout(1000);
+          await page.waitForTimeout(500); // Reduced wait time
           
           const linkHtml = await page.content();
           const regionBlockMessage = detectRegionBlock(linkHtml, link);
@@ -550,26 +578,62 @@ async function scrapePage(page, url, options = {}) {
 
 // Error handling configuration
 const ERROR_BREAK_CONDITIONS = {
-  maxConsecutiveErrors: 5,        // Break after 5 consecutive errors
-  maxTotalErrors: 10,             // Break after 10 total errors
-  criticalErrorPatterns: [        // Patterns that indicate critical system issues
-    'ECONNREFUSED',
-    'ENOTFOUND',
-    'ETIMEDOUT',
+  maxConsecutiveErrors: 10,       // Break after 10 consecutive errors (increased)
+  maxTotalErrors: 25,             // Break after 25 total errors (increased)
+  criticalErrorPatterns: [        // Only truly critical system issues that indicate browser/server problems
     'browser has been closed',
     'Target page, context or browser has been closed',
     'Protocol error',
-    'Navigation timeout',
     'net::ERR_INTERNET_DISCONNECTED',
     'net::ERR_NETWORK_CHANGED',
-    'net::ERR_CONNECTION_RESET'
+    'net::ERR_CONNECTION_RESET',
+    'Cannot access',
+    'ReferenceError',
+    'TypeError',
+    'SyntaxError'
   ],
-  maxErrorRate: 0.7               // Break if error rate exceeds 70%
+  maxErrorRate: 0.8,              // Break if error rate exceeds 80% (increased)
+  maxCriticalErrors: 5            // Break after 5 critical system errors
 };
 
 // Error handling utility functions
 function isCriticalError(errorMessage) {
   const message = errorMessage.toLowerCase();
+  
+  // First check if it's a known non-critical website error
+  const nonCriticalPatterns = [
+    'cloudflare',
+    'blocked',
+    '403',
+    '404',
+    '500',
+    '502',
+    '503',
+    '504',
+    'timeout',
+    'econnrefused',
+    'enotfound',
+    'etimedout',
+    'navigation timeout',
+    'page crashed',
+    'net::err_',
+    'this website is using a security service',
+    'access denied',
+    'forbidden',
+    'not found',
+    'server error',
+    'service unavailable',
+    'gateway timeout',
+    'too many requests',
+    'rate limit'
+  ];
+  
+  // If it's a common website error, don't treat as critical
+  if (nonCriticalPatterns.some(pattern => message.includes(pattern))) {
+    return false;
+  }
+  
+  // Only treat as critical if it matches our critical patterns
   return ERROR_BREAK_CONDITIONS.criticalErrorPatterns.some(pattern => 
     message.includes(pattern.toLowerCase())
   );
@@ -604,7 +668,7 @@ function shouldBreakScraping(errorStats, currentIndex, totalUrls) {
   }
   
   // Check critical errors
-  if (criticalErrors >= 3) {
+  if (criticalErrors >= ERROR_BREAK_CONDITIONS.maxCriticalErrors) {
     return {
       shouldBreak: true,
       reason: `Too many critical system errors (${criticalErrors})`
@@ -617,12 +681,32 @@ function shouldBreakScraping(errorStats, currentIndex, totalUrls) {
 function updateErrorStats(errorStats, error, isSuccess) {
   if (isSuccess) {
     errorStats.consecutiveErrors = 0;
+    errorStats.successCount = (errorStats.successCount || 0) + 1;
+    
+    // Reset critical errors after 5 successful scrapes
+    if (errorStats.successCount >= 5) {
+      errorStats.criticalErrors = 0;
+      errorStats.successCount = 0;
+      logger.info('Error stats reset after 5 successful scrapes');
+    }
   } else {
     errorStats.consecutiveErrors++;
     errorStats.totalErrors++;
     
-    if (isCriticalError(error)) {
+    const isCritical = isCriticalError(error);
+    if (isCritical) {
       errorStats.criticalErrors++;
+      logger.warn(`Critical error detected: ${error}`, {
+        criticalErrors: errorStats.criticalErrors,
+        totalErrors: errorStats.totalErrors,
+        consecutiveErrors: errorStats.consecutiveErrors
+      });
+    } else {
+      logger.info(`Non-critical error: ${error}`, {
+        criticalErrors: errorStats.criticalErrors,
+        totalErrors: errorStats.totalErrors,
+        consecutiveErrors: errorStats.consecutiveErrors
+      });
     }
   }
   
@@ -690,11 +774,61 @@ app.post('/api/scrape', async (req, res) => {
           '--disable-features=VizDisplayCompositor',
           '--disable-background-timer-throttling',
           '--disable-backgrounding-occluded-windows',
-          '--disable-renderer-backgrounding'
+          '--disable-renderer-backgrounding',
+          '--disable-images',
+          '--disable-plugins',
+          '--disable-extensions',
+          '--disable-default-apps',
+          '--disable-sync',
+          '--disable-translate',
+          '--disable-logging',
+          '--disable-permissions-api',
+          '--disable-presentation-api',
+          '--disable-print-preview',
+          '--disable-speech-api',
+          '--disable-file-system',
+          '--disable-notifications',
+          '--disable-webgl',
+          '--disable-webgl2',
+          '--disable-3d-apis',
+          '--disable-accelerated-video-decode',
+          '--disable-accelerated-mjpeg-decode',
+          '--disable-accelerated-video-encode',
+          '--disable-gpu-sandbox',
+          '--disable-software-rasterizer',
+          '--disable-background-networking',
+          '--disable-client-side-phishing-detection',
+          '--disable-component-update',
+          '--disable-domain-reliability',
+          '--disable-features=TranslateUI',
+          '--disable-ipc-flooding-protection',
+          '--disable-hang-monitor',
+          '--disable-prompt-on-repost',
+          '--disable-sync-preferences',
+          '--disable-web-resources',
+          '--disable-xss-auditor',
+          '--disable-features=VizDisplayCompositor',
+          '--aggressive-cache-discard',
+          '--memory-pressure-off',
+          '--max_old_space_size=4096'
         ]
       });
       
       const page = await browser.newPage();
+      
+      // Block resources for faster loading (images, videos, fonts, stylesheets, etc.)
+      await page.setRequestInterception(true);
+      page.on('request', (request) => {
+        const resourceType = request.resourceType();
+        const url = request.url();
+        
+        // Block images, videos, fonts, stylesheets, and other heavy resources
+        if (['image', 'media', 'font', 'stylesheet', 'manifest'].includes(resourceType)) {
+          request.abort();
+        } else {
+          request.continue();
+        }
+      });
       
       // Set additional page options
       await page.setViewport({ width: 1920, height: 1080 });
@@ -704,9 +838,22 @@ app.post('/api/scrape', async (req, res) => {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
       });
       
+      // Disable CSS animations and transitions for faster rendering
+      await page.addStyleTag({
+        content: `
+          *, *::before, *::after {
+            animation-duration: 0s !important;
+            animation-delay: 0s !important;
+            transition-duration: 0s !important;
+            transition-delay: 0s !important;
+            scroll-behavior: auto !important;
+          }
+        `
+      });
+      
       // Process each URL with error handling
       try {
-        for (let i = 0; i < urls.length; i++) {
+      for (let i = 0; i < urls.length; i++) {
         const url = urls[i];
         const normalizedUrl = normalizeUrl(url);
         
@@ -910,26 +1057,26 @@ app.post('/api/scrape', async (req, res) => {
       
       // Build dynamic CSV headers based on available data
       const baseHeaders = [
-        { id: 'website', title: 'Website' },
-        { id: 'emails', title: 'Emails' },
-        { id: 'facebook', title: 'Facebook' },
-        { id: 'twitter', title: 'Twitter' },
-        { id: 'linkedin', title: 'LinkedIn' },
-        { id: 'instagram', title: 'Instagram' },
-        { id: 'youtube', title: 'YouTube' },
-        { id: 'tiktok', title: 'TikTok' },
-        { id: 'pinterest', title: 'Pinterest' },
-        { id: 'snapchat', title: 'Snapchat' },
-        { id: 'reddit', title: 'Reddit' },
-        { id: 'telegram', title: 'Telegram' },
-        { id: 'whatsapp', title: 'WhatsApp' },
-        { id: 'discord', title: 'Discord' },
-        { id: 'phoneNumbers', title: 'Phone Numbers' },
-        { id: 'addresses', title: 'Addresses' },
+          { id: 'website', title: 'Website' },
+          { id: 'emails', title: 'Emails' },
+          { id: 'facebook', title: 'Facebook' },
+          { id: 'twitter', title: 'Twitter' },
+          { id: 'linkedin', title: 'LinkedIn' },
+          { id: 'instagram', title: 'Instagram' },
+          { id: 'youtube', title: 'YouTube' },
+          { id: 'tiktok', title: 'TikTok' },
+          { id: 'pinterest', title: 'Pinterest' },
+          { id: 'snapchat', title: 'Snapchat' },
+          { id: 'reddit', title: 'Reddit' },
+          { id: 'telegram', title: 'Telegram' },
+          { id: 'whatsapp', title: 'WhatsApp' },
+          { id: 'discord', title: 'Discord' },
+          { id: 'phoneNumbers', title: 'Phone Numbers' },
+          { id: 'addresses', title: 'Addresses' },
         { id: 'optimizationNote', title: 'Optimization Note' },
         { id: 'isCriticalError', title: 'Critical Error' },
         { id: 'skipped', title: 'Skipped' },
-        { id: 'error', title: 'Error' }
+          { id: 'error', title: 'Error' }
       ];
       
       // Add original CSV columns if available
@@ -959,26 +1106,26 @@ app.post('/api/scrape', async (req, res) => {
       
       const csvData = results.map(result => {
         const baseData = {
-          website: result.website,
-          emails: result.emails.join('; '),
-          facebook: result.socialLinks.facebook || '',
-          twitter: result.socialLinks.twitter || '',
-          linkedin: result.socialLinks.linkedin || '',
-          instagram: result.socialLinks.instagram || '',
-          youtube: result.socialLinks.youtube || '',
-          tiktok: result.socialLinks.tiktok || '',
-          pinterest: result.socialLinks.pinterest || '',
-          snapchat: result.socialLinks.snapchat || '',
-          reddit: result.socialLinks.reddit || '',
-          telegram: result.socialLinks.telegram || '',
-          whatsapp: result.socialLinks.whatsapp || '',
-          discord: result.socialLinks.discord || '',
-          phoneNumbers: result.phoneNumbers.join('; '),
-          addresses: result.addresses.join('; '),
+        website: result.website,
+        emails: result.emails.join('; '),
+        facebook: result.socialLinks.facebook || '',
+        twitter: result.socialLinks.twitter || '',
+        linkedin: result.socialLinks.linkedin || '',
+        instagram: result.socialLinks.instagram || '',
+        youtube: result.socialLinks.youtube || '',
+        tiktok: result.socialLinks.tiktok || '',
+        pinterest: result.socialLinks.pinterest || '',
+        snapchat: result.socialLinks.snapchat || '',
+        reddit: result.socialLinks.reddit || '',
+        telegram: result.socialLinks.telegram || '',
+        whatsapp: result.socialLinks.whatsapp || '',
+        discord: result.socialLinks.discord || '',
+        phoneNumbers: result.phoneNumbers.join('; '),
+        addresses: result.addresses.join('; '),
           optimizationNote: result.optimizationNote || '',
           isCriticalError: result.isCriticalError ? 'Yes' : 'No',
           skipped: result.skipped ? 'Yes' : 'No',
-          error: result.error || ''
+        error: result.error || ''
         };
         
         // Add original CSV data
@@ -1023,7 +1170,7 @@ app.post('/api/scrape', async (req, res) => {
         message: responseMessage,
         duration: `${duration}ms`,
         statistics: {
-          totalUrls: urls.length,
+        totalUrls: urls.length,
           processedUrls: processedUrls,
           successfulUrls: successfulUrls,
           errorUrls: errorUrls,
